@@ -1,3 +1,11 @@
+source-repository-package
+  type: git
+  location: git://github.com/prozacchiwawa/generic-deriving.git
+  branch: master
+
+source-repository-package
+  type: git
+  location: git://github.com/prozacchiwawa/transformers-compat.git
+  branch: master
+
 packages: .
-tests: true
-benchmarks: true

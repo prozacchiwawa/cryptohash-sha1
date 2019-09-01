@@ -1,3 +1,4 @@
+{-# LANGUAGE ScopedTypeVariables #-}
 -- |
 -- Module      : Crypto.Hash.SHA1
 -- License     : BSD-style
@@ -35,12 +36,12 @@ module Crypto.Hash.SHA1
     -- >     ctx    = foldl SHA1.update ctx0 (map Data.ByteString.pack [ [1,2,3], [4,5,6] ])
     -- >     ctx0   = SHA1.init
 
-      Ctx(..)
+      Ctx
     , init     -- :: Ctx
     , update   -- :: Ctx -> ByteString -> Ctx
     , updates  -- :: Ctx -> [ByteString] -> Ctx
     , finalize -- :: Ctx -> ByteString
-    , start    -- :: ByteString -> Ct
+    , start    -- :: ByteString -> Ctx
     , startlazy -- :: L.ByteString -> Ctx
 
     -- * Single Pass API
@@ -77,26 +78,22 @@ module Crypto.Hash.SHA1
     ) where
 
 import Prelude hiding (init)
-import Foreign.C.Types
-import Foreign.Ptr
-import Foreign.ForeignPtr (withForeignPtr)
-import Foreign.Marshal.Alloc
+import Control.Monad
 import qualified Data.ByteString.Lazy as L
 import qualified Data.ByteString as B
 import Data.ByteString (ByteString)
-import Data.ByteString.Unsafe (unsafeUseAsCStringLen)
-import Data.ByteString.Internal (create, toForeignPtr, memcpy)
 import Data.Bits (xor)
 import Data.Word
-import System.IO.Unsafe (unsafeDupablePerformIO)
+
+import Java
 
 -- | perform IO for hashes that do allocation and ffi.
 -- unsafeDupablePerformIO is used when possible as the
 -- computation is pure and the output is directly linked
 -- to the input. we also do not modify anything after it has
 -- been returned to the user.
-unsafeDoIO :: IO a -> a
-unsafeDoIO = unsafeDupablePerformIO
+-- unsafeDoIO :: IO a -> a
+-- unsafeDoIO = unsafeDupablePerformIO
 
 -- | SHA-1 Context
 --
@@ -112,126 +109,85 @@ unsafeDoIO = unsafeDupablePerformIO
 --  * a 5-element 'Word32' array holding the current work-in-progress digest-value.
 --
 -- Consequently, a SHA-1 digest as produced by 'hash', 'hashlazy', or 'finalize' is 20 bytes long.
-newtype Ctx = Ctx ByteString
-  deriving (Eq)
+data MessageDigest = MessageDigest @java.security.MessageDigest
+  deriving (Eq, Class)
 
--- keep this synchronised with cbits/sha1.h
-{-# INLINE digestSize #-}
-digestSize :: Int
-digestSize = 20
+type Ctx = MessageDigest
 
-{-# INLINE sizeCtx #-}
-sizeCtx :: Int
-sizeCtx = 92
+foreign import java unsafe "@static MessageDigest.getInstance" messageDigestGetInstance :: String -> Java a MessageDigest
 
-{-# INLINE withByteStringPtr #-}
-withByteStringPtr :: ByteString -> (Ptr Word8 -> IO a) -> IO a
-withByteStringPtr b f =
-    withForeignPtr fptr $ \ptr -> f (ptr `plusPtr` off)
-    where (fptr, off, _) = toForeignPtr b
+foreign import java unsafe "@interface clone" cloneMessageDigest :: Java MessageDigest MessageDigest
+foreign import java unsafe "@interface update" updateMessageDigest :: JByteArray -> Java MessageDigest ()
+foreign import java unsafe "@interface getDigestLength" getDigestLength :: Java MessageDigest Int
+foreign import java unsafe "@interface digest" digestMessageDigest :: Java MessageDigest JByteArray
 
-copyCtx :: Ptr Ctx -> Ptr Ctx -> IO ()
-copyCtx dst src = memcpy (castPtr dst) (castPtr src) (fromIntegral sizeCtx)
-
-withCtxCopy :: Ctx -> (Ptr Ctx -> IO ()) -> IO Ctx
-withCtxCopy (Ctx ctxB) f = Ctx `fmap` createCtx
-  where
-    createCtx = create sizeCtx $ \dstPtr ->
-                withByteStringPtr ctxB $ \srcPtr -> do
-                    copyCtx (castPtr dstPtr) (castPtr srcPtr)
-                    f (castPtr dstPtr)
-
-withCtxThrow :: Ctx -> (Ptr Ctx -> IO a) -> IO a
-withCtxThrow (Ctx ctxB) f =
-    allocaBytes sizeCtx $ \dstPtr ->
-    withByteStringPtr ctxB $ \srcPtr -> do
-        copyCtx (castPtr dstPtr) (castPtr srcPtr)
-        f (castPtr dstPtr)
-
-withCtxNew :: (Ptr Ctx -> IO ()) -> IO Ctx
-withCtxNew f = Ctx `fmap` create sizeCtx (f . castPtr)
-
-withCtxNewThrow :: (Ptr Ctx -> IO a) -> IO a
-withCtxNewThrow f = allocaBytes sizeCtx (f . castPtr)
-
-foreign import ccall unsafe "sha1.h hs_cryptohash_sha1_init"
-    c_sha1_init :: Ptr Ctx -> IO ()
-
-foreign import ccall unsafe "sha1.h hs_cryptohash_sha1_update"
-    c_sha1_update_unsafe :: Ptr Ctx -> Ptr Word8 -> CSize -> IO ()
-
-foreign import ccall safe "sha1.h hs_cryptohash_sha1_update"
-    c_sha1_update_safe :: Ptr Ctx -> Ptr Word8 -> CSize -> IO ()
-
--- 'safe' call overhead is negligible for 8KiB and more
-c_sha1_update :: Ptr Ctx -> Ptr Word8 -> CSize -> IO ()
-c_sha1_update pctx pbuf sz
-  | sz < 8192 = c_sha1_update_unsafe pctx pbuf sz
-  | otherwise  = c_sha1_update_safe   pctx pbuf sz
-
-foreign import ccall unsafe "sha1.h hs_cryptohash_sha1_finalize"
-    c_sha1_finalize :: Ptr Ctx -> Ptr Word8 -> IO ()
-
-updateInternalIO :: Ptr Ctx -> ByteString -> IO ()
-updateInternalIO ptr d =
-    unsafeUseAsCStringLen d (\(cs, len) -> c_sha1_update ptr (castPtr cs) (fromIntegral len))
-
-finalizeInternalIO :: Ptr Ctx -> IO ByteString
-finalizeInternalIO ptr = create digestSize (c_sha1_finalize ptr)
-
-{-# NOINLINE init #-}
--- | create a new hash context
 init :: Ctx
-init = unsafeDoIO $ withCtxNew $ c_sha1_init
+init = unsafePerformJava $ messageDigestGetInstance "SHA-1"
 
-validCtx :: Ctx -> Bool
-validCtx (Ctx b) = B.length b == sizeCtx
+primitiveUpdate :: Ctx -> ByteString -> Java a ()
+primitiveUpdate ctx bytes = do
+  byteArray :: JByteArray <- anew (B.length bytes)
 
-{-# NOINLINE update #-}
--- | update a context with a bytestring
+  forM_ [0..(B.length bytes) - 1] (copyWord8ToByte bytes byteArray)
+
+  ctx <.> updateMessageDigest byteArray
+
+  pure ()
+  where
+    copyWord8ToByte :: ByteString -> JByteArray -> Int -> Java b ()
+    copyWord8ToByte bytestr byteArray idx = do
+       let
+         theByteWord8 = B.index bytestr idx
+         theByte :: Byte = fromIntegral theByteWord8
+
+       byteArray <.> aset idx theByte
+
 update :: Ctx -> ByteString -> Ctx
-update ctx d
-  | validCtx ctx = unsafeDoIO $ withCtxCopy ctx $ \ptr -> updateInternalIO ptr d
-  | otherwise    = error "SHA1.update: invalid Ctx"
+update ctx bytes = unsafePerformJava $ do
+  newCtx <- ctx <.> cloneMessageDigest
+  primitiveUpdate newCtx bytes
+  pure $ newCtx
 
-{-# NOINLINE updates #-}
--- | updates a context with multiple bytestrings
 updates :: Ctx -> [ByteString] -> Ctx
-updates ctx d
-  | validCtx ctx = unsafeDoIO $ withCtxCopy ctx $ \ptr -> mapM_ (updateInternalIO ptr) d
-  | otherwise    = error "SHA1.updates: invalid Ctx"
+updates ctx updatelist = unsafePerformJava $ do
+  newCtx <- ctx <.> cloneMessageDigest
+  runUpdates newCtx updatelist
+  pure $ newCtx
+  where
+    runUpdates :: Ctx -> [ByteString] -> Java a ()
+    runUpdates _ [] = pure ()
+    runUpdates ctx' (h : hs) = do
+      primitiveUpdate ctx' h
+      runUpdates ctx' hs
 
-{-# NOINLINE finalize #-}
--- | finalize the context into a digest bytestring (20 bytes)
 finalize :: Ctx -> ByteString
-finalize ctx
-  | validCtx ctx = unsafeDoIO $ withCtxThrow ctx finalizeInternalIO
-  | otherwise    = error "SHA1.finalize: invalid Ctx"
+finalize ctx = unsafePerformJava $ do
+  len <- ctx <.> getDigestLength
+  byteArray :: JByteArray <- ctx <.> digestMessageDigest
+  digestBytes :: [Word8] <-
+    mapM
+      (\idx -> do
+          theByte :: Byte <- byteArray <.> aget idx
+          pure $ (fromIntegral . toInteger) theByte
+      )
+      [0 .. len - 1]
+  pure $ B.pack digestBytes
+
+start :: ByteString -> Ctx
+start bs = update init bs
+
+startlazy :: L.ByteString -> Ctx
+startlazy lbs = start $ (B.pack . L.unpack) lbs
 
 {-# NOINLINE hash #-}
 -- | hash a strict bytestring into a digest bytestring (20 bytes)
 hash :: ByteString -> ByteString
-hash d = unsafeDoIO $ withCtxNewThrow $ \ptr -> do
-    c_sha1_init ptr >> updateInternalIO ptr d >> finalizeInternalIO ptr
-
-{-# NOINLINE start #-}
--- | hash a strict bytestring into a Ctx
-start :: ByteString -> Ctx
-start d = unsafeDoIO $ withCtxNew $ \ptr -> do
-    c_sha1_init ptr >> updateInternalIO ptr d
+hash d = finalize $ start d
 
 {-# NOINLINE hashlazy #-}
 -- | hash a lazy bytestring into a digest bytestring (20 bytes)
 hashlazy :: L.ByteString -> ByteString
-hashlazy l = unsafeDoIO $ withCtxNewThrow $ \ptr -> do
-    c_sha1_init ptr >> mapM_ (updateInternalIO ptr) (L.toChunks l) >> finalizeInternalIO ptr
-
-{-# NOINLINE startlazy #-}
--- | hash a lazy bytestring into a Ctx
-startlazy :: L.ByteString -> Ctx
-startlazy l = unsafeDoIO $ withCtxNew $ \ptr -> do
-    c_sha1_init ptr >> mapM_ (updateInternalIO ptr) (L.toChunks l)
-
+hashlazy l = finalize $ startlazy l
 
 {-# NOINLINE hmac #-}
 -- | Compute 20-byte <https://tools.ietf.org/html/rfc2104 RFC2104>-compatible
